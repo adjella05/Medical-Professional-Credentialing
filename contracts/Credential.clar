@@ -12,6 +12,8 @@
 (define-constant ERR-INVALID-STATUS (err u6))
 (define-constant ERR-CREDENTIAL-REVOKED (err u7))
 (define-constant ERR-INSUFFICIENT-PAYMENT (err u8))
+(define-constant ERR-ALREADY-SUBSCRIBED (err u9))
+(define-constant ERR-NOT-SUBSCRIBED (err u10))
 
 (define-constant STATUS-ACTIVE u1)
 (define-constant STATUS-EXPIRED u2)
@@ -26,6 +28,8 @@
 (define-data-var contract-enabled bool true)
 (define-data-var total-credentials uint u0)
 (define-data-var total-verifications uint u0)
+(define-data-var alert-enabled bool true)
+(define-data-var total-alerts uint u0)
 
 (define-map credentials
   uint
@@ -76,6 +80,31 @@
   uint
   (list 10 { renewed-at: uint, new-expiry: uint, renewed-by: principal })
 )
+
+;; Alert System Maps
+(define-map alert-subscriptions
+  { subscriber: principal, credential-id: uint }
+  {
+    alert-types: (list 5 (string-ascii 20)),
+    subscribed-at: uint,
+    notification-threshold: uint,
+    active: bool
+  }
+)
+
+(define-map alert-history
+  { alert-id: uint }
+  {
+    credential-id: uint,
+    alert-type: (string-ascii 20),
+    recipient: principal,
+    message: (string-ascii 200),
+    triggered-at: uint,
+    acknowledged: bool
+  }
+)
+
+(define-data-var next-alert-id uint u1)
 
 (define-public (authorize-issuer (issuer principal) (name (string-ascii 100)) (authority-type (string-ascii 50)))
   (begin
@@ -474,5 +503,122 @@
     false
   )
 )
+
+;; === ALERT SYSTEM FUNCTIONS ===
+
+;; Subscribe to alerts for a specific credential
+(define-public (subscribe-to-alerts (credential-id uint) (alert-type (string-ascii 20)))
+  (let
+    (
+      (subscription-key { subscriber: tx-sender, credential-id: credential-id })
+      (credential (unwrap! (map-get? credentials credential-id) ERR-CREDENTIAL-NOT-FOUND))
+    )
+    (asserts! (var-get alert-enabled) ERR-NOT-AUTHORIZED)
+    (asserts! (is-none (map-get? alert-subscriptions subscription-key)) ERR-ALREADY-SUBSCRIBED)
+    
+    (ok (map-set alert-subscriptions subscription-key {
+      alert-types: (list alert-type),
+      subscribed-at: stacks-block-height,
+      notification-threshold: u100,
+      active: true
+    }))
+  )
+)
+
+;; Unsubscribe from credential alerts
+(define-public (unsubscribe-from-alerts (credential-id uint))
+  (let
+    (
+      (subscription-key { subscriber: tx-sender, credential-id: credential-id })
+      (existing-subscription (unwrap! (map-get? alert-subscriptions subscription-key) ERR-NOT-SUBSCRIBED))
+    )
+    (asserts! (var-get alert-enabled) ERR-NOT-AUTHORIZED)
+    
+    (ok (map-set alert-subscriptions subscription-key 
+      (merge existing-subscription { active: false })
+    ))
+  )
+)
+
+;; Create an alert manually (authorized users only)
+(define-public (create-alert (credential-id uint) (alert-type (string-ascii 20)) (message (string-ascii 200)))
+  (let
+    (
+      (credential (unwrap! (map-get? credentials credential-id) ERR-CREDENTIAL-NOT-FOUND))
+      (alert-id (var-get next-alert-id))
+    )
+    (asserts! (var-get alert-enabled) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq tx-sender (get issuer credential)) ERR-NOT-AUTHORIZED)
+    
+    (map-set alert-history { alert-id: alert-id } {
+      credential-id: credential-id,
+      alert-type: alert-type,
+      recipient: (get holder credential),
+      message: message,
+      triggered-at: stacks-block-height,
+      acknowledged: false
+    })
+    
+    (var-set next-alert-id (+ alert-id u1))
+    (var-set total-alerts (+ (var-get total-alerts) u1))
+    (ok alert-id)
+  )
+)
+
+;; Acknowledge an alert (mark as read)
+(define-public (acknowledge-alert (alert-id uint))
+  (let
+    (
+      (alert (unwrap! (map-get? alert-history { alert-id: alert-id }) ERR-CREDENTIAL-NOT-FOUND))
+    )
+    (asserts! (is-eq (get recipient alert) tx-sender) ERR-NOT-AUTHORIZED)
+    
+    (ok (map-set alert-history { alert-id: alert-id }
+      (merge alert { acknowledged: true })
+    ))
+  )
+)
+
+;; Toggle alert system on/off (owner only)
+(define-public (toggle-alert-system (enabled bool))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (ok (var-set alert-enabled enabled))
+  )
+)
+
+;; === ALERT SYSTEM READ-ONLY FUNCTIONS ===
+
+;; Get subscription details for a credential
+(define-read-only (get-alert-subscription (subscriber principal) (credential-id uint))
+  (map-get? alert-subscriptions { subscriber: subscriber, credential-id: credential-id })
+)
+
+;; Get alert history for a specific credential
+(define-read-only (get-credential-alert-history (credential-id uint) (limit uint))
+  (var-get total-alerts)
+)
+
+;; Get user's alert subscriptions
+(define-read-only (get-user-subscriptions (subscriber principal))
+  (var-get total-alerts)
+)
+
+;; Get alert system statistics
+(define-read-only (get-alert-stats)
+  {
+    total-alerts: (var-get total-alerts),
+    next-alert-id: (var-get next-alert-id),
+    alert-enabled: (var-get alert-enabled),
+    current-block: stacks-block-height
+  }
+)
+
+;; Get unacknowledged alerts for a user
+(define-read-only (get-unacknowledged-alerts (recipient principal))
+  (var-get total-alerts)
+)
+
+
 
 (authorize-issuer CONTRACT-OWNER "Contract Owner" "system-admin")
