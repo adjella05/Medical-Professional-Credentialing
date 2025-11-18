@@ -66,6 +66,6 @@ plan:
         - emulated-contract-publish:
             contract-name: Credential
             emulated-sender: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
-            path: contracts/Credential.clar
+            path: "contracts\\Credential.clar"
             clarity-version: 3
       epoch: "3.2"

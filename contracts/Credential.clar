@@ -14,11 +14,18 @@
 (define-constant ERR-INSUFFICIENT-PAYMENT (err u8))
 (define-constant ERR-ALREADY-SUBSCRIBED (err u9))
 (define-constant ERR-NOT-SUBSCRIBED (err u10))
+(define-constant ERR-INVALID-VISIBILITY (err u11))
+(define-constant ERR-ACCESS-DENIED (err u12))
 
 (define-constant STATUS-ACTIVE u1)
 (define-constant STATUS-EXPIRED u2)
 (define-constant STATUS-REVOKED u3)
 (define-constant STATUS-SUSPENDED u4)
+
+(define-constant VISIBILITY-PUBLIC u1)
+(define-constant VISIBILITY-ISSUER-ONLY u2)
+(define-constant VISIBILITY-HOLDER-ONLY u3)
+(define-constant VISIBILITY-PRIVATE u4)
 
 (define-constant CREDENTIAL-FEE u1000000)
 (define-constant RENEWAL-FEE u500000)
@@ -30,6 +37,17 @@
 (define-data-var total-verifications uint u0)
 (define-data-var alert-enabled bool true)
 (define-data-var total-alerts uint u0)
+(define-data-var visibility-defaults-enabled bool true)
+
+(define-map credential-visibility
+  uint
+  uint
+)
+
+(define-map credential-access-grants
+  { credential-id: uint, viewer: principal }
+  bool
+)
 
 (define-map credentials
   uint
@@ -504,6 +522,94 @@
   )
 )
 
+;; === VISIBILITY CONTROL FUNCTIONS ===
+
+(define-public (set-credential-visibility (credential-id uint) (visibility-level uint))
+  (let
+    (
+      (credential (unwrap! (map-get? credentials credential-id) ERR-CREDENTIAL-NOT-FOUND))
+    )
+    (asserts! (var-get contract-enabled) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq tx-sender (get holder credential)) ERR-NOT-AUTHORIZED)
+    (asserts! (and (>= visibility-level u1) (<= visibility-level u4)) ERR-INVALID-VISIBILITY)
+    (ok (map-set credential-visibility credential-id visibility-level))
+  )
+)
+
+(define-public (grant-credential-access (credential-id uint) (viewer principal))
+  (let
+    (
+      (credential (unwrap! (map-get? credentials credential-id) ERR-CREDENTIAL-NOT-FOUND))
+    )
+    (asserts! (var-get contract-enabled) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq tx-sender (get holder credential)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status credential) STATUS-ACTIVE) ERR-CREDENTIAL-REVOKED)
+    (ok (map-set credential-access-grants { credential-id: credential-id, viewer: viewer } true))
+  )
+)
+
+(define-public (revoke-credential-access (credential-id uint) (viewer principal))
+  (let
+    (
+      (credential (unwrap! (map-get? credentials credential-id) ERR-CREDENTIAL-NOT-FOUND))
+    )
+    (asserts! (var-get contract-enabled) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq tx-sender (get holder credential)) ERR-NOT-AUTHORIZED)
+    (ok (map-set credential-access-grants { credential-id: credential-id, viewer: viewer } false))
+  )
+)
+
+(define-public (toggle-credential-public (credential-id uint) (is-public bool))
+  (let
+    (
+      (credential (unwrap! (map-get? credentials credential-id) ERR-CREDENTIAL-NOT-FOUND))
+      (new-visibility (if is-public VISIBILITY-PUBLIC VISIBILITY-PRIVATE))
+    )
+    (asserts! (var-get contract-enabled) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq tx-sender (get holder credential)) ERR-NOT-AUTHORIZED)
+    (ok (map-set credential-visibility credential-id new-visibility))
+  )
+)
+
+(define-read-only (get-credential-visibility (credential-id uint))
+  (match (map-get? credential-visibility credential-id)
+    visibility visibility
+    VISIBILITY-PUBLIC
+  )
+)
+
+(define-read-only (can-view-credential (credential-id uint) (viewer principal))
+  (match (map-get? credentials credential-id)
+    credential
+      (let
+        (
+          (visibility (get-credential-visibility credential-id))
+          (is-holder (is-eq viewer (get holder credential)))
+          (is-issuer (is-eq viewer (get issuer credential)))
+          (has-access (default-to false (map-get? credential-access-grants { credential-id: credential-id, viewer: viewer })))
+        )
+        (or
+          (is-eq visibility VISIBILITY-PUBLIC)
+          is-holder
+          (and (is-eq visibility VISIBILITY-ISSUER-ONLY) is-issuer)
+          has-access
+        )
+      )
+    false
+  )
+)
+
+(define-read-only (get-credential-access-count (credential-id uint))
+  (match (map-get? credentials credential-id)
+    credential (if (is-some (map-get? credentials credential-id)) u1 u0)
+    u0
+  )
+)
+
+(define-read-only (is-credential-public (credential-id uint))
+  (is-eq (get-credential-visibility credential-id) VISIBILITY-PUBLIC)
+)
+
 ;; === ALERT SYSTEM FUNCTIONS ===
 
 ;; Subscribe to alerts for a specific credential
@@ -619,6 +725,248 @@
   (var-get total-alerts)
 )
 
+;; === CREDENTIAL AUDIT LOCK & FREEZE SYSTEM ===
 
+(define-map credential-freeze-status
+  uint
+  {
+    frozen: bool,
+    frozen-at: uint,
+    freeze-reason: (string-ascii 200),
+    frozen-by: principal
+  }
+)
+
+(define-map credential-pause-status
+  uint
+  {
+    paused: bool,
+    paused-at: uint,
+    paused-by: principal
+  }
+)
+
+(define-map credential-audit-lock
+  uint
+  {
+    locked: bool,
+    locked-at: uint,
+    lock-reason: (string-ascii 200),
+    locked-by: principal
+  }
+)
+
+(define-map verification-attempt-count
+  uint
+  {
+    total-attempts: uint,
+    last-attempt-at: uint,
+    reset-at: uint
+  }
+)
+
+(define-constant VERIFICATION-ATTEMPT-THRESHOLD u1000)
+(define-constant ATTEMPT-RESET-BLOCKS u5760)
+(define-constant ERR-CREDENTIAL-FROZEN (err u20))
+(define-constant ERR-CREDENTIAL-PAUSED (err u21))
+(define-constant ERR-CREDENTIAL-AUDIT-LOCKED (err u22))
+(define-constant ERR-VERIFICATION-SPAM (err u23))
+(define-constant ERR-INVALID-FREEZE-REASON (err u24))
+(define-constant ERR-NOT-FROZEN (err u25))
+(define-constant ERR-NOT-PAUSED (err u26))
+(define-constant ERR-NOT-AUDIT-LOCKED (err u27))
+
+(define-public (freeze-credential (credential-id uint) (reason (string-ascii 200)))
+  (let
+    (
+      (credential (unwrap! (map-get? credentials credential-id) ERR-CREDENTIAL-NOT-FOUND))
+      (current-block stacks-block-height)
+    )
+    (asserts! (var-get contract-enabled) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq tx-sender (get issuer credential)) ERR-NOT-AUTHORIZED)
+    (asserts! (> (len reason) u0) ERR-INVALID-FREEZE-REASON)
+    
+    (ok (map-set credential-freeze-status credential-id {
+      frozen: true,
+      frozen-at: current-block,
+      freeze-reason: reason,
+      frozen-by: tx-sender
+    }))
+  )
+)
+
+(define-public (unfreeze-credential (credential-id uint))
+  (let
+    (
+      (credential (unwrap! (map-get? credentials credential-id) ERR-CREDENTIAL-NOT-FOUND))
+      (freeze-data (unwrap! (map-get? credential-freeze-status credential-id) ERR-NOT-FROZEN))
+    )
+    (asserts! (var-get contract-enabled) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq tx-sender (get issuer credential)) ERR-NOT-AUTHORIZED)
+    (asserts! (get frozen freeze-data) ERR-NOT-FROZEN)
+    
+    (ok (map-set credential-freeze-status credential-id (merge freeze-data { frozen: false })))
+  )
+)
+
+(define-public (emergency-pause-credential (credential-id uint))
+  (let
+    (
+      (credential (unwrap! (map-get? credentials credential-id) ERR-CREDENTIAL-NOT-FOUND))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (var-get contract-enabled) ERR-NOT-AUTHORIZED)
+    
+    (ok (map-set credential-pause-status credential-id {
+      paused: true,
+      paused-at: current-block,
+      paused-by: tx-sender
+    }))
+  )
+)
+
+(define-public (resume-credential (credential-id uint))
+  (let
+    (
+      (credential (unwrap! (map-get? credentials credential-id) ERR-CREDENTIAL-NOT-FOUND))
+      (pause-data (unwrap! (map-get? credential-pause-status credential-id) ERR-NOT-PAUSED))
+    )
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (var-get contract-enabled) ERR-NOT-AUTHORIZED)
+    (asserts! (get paused pause-data) ERR-NOT-PAUSED)
+    
+    (ok (map-set credential-pause-status credential-id (merge pause-data { paused: false })))
+  )
+)
+
+(define-public (audit-lock-credential (credential-id uint) (reason (string-ascii 200)))
+  (let
+    (
+      (credential (unwrap! (map-get? credentials credential-id) ERR-CREDENTIAL-NOT-FOUND))
+      (current-block stacks-block-height)
+    )
+    (asserts! (var-get contract-enabled) ERR-NOT-AUTHORIZED)
+    (asserts! (or (is-eq tx-sender (get issuer credential)) (is-eq tx-sender CONTRACT-OWNER)) ERR-NOT-AUTHORIZED)
+    (asserts! (> (len reason) u0) ERR-INVALID-FREEZE-REASON)
+    
+    (ok (map-set credential-audit-lock credential-id {
+      locked: true,
+      locked-at: current-block,
+      lock-reason: reason,
+      locked-by: tx-sender
+    }))
+  )
+)
+
+(define-public (audit-unlock-credential (credential-id uint))
+  (let
+    (
+      (credential (unwrap! (map-get? credentials credential-id) ERR-CREDENTIAL-NOT-FOUND))
+      (lock-data (unwrap! (map-get? credential-audit-lock credential-id) ERR-NOT-AUDIT-LOCKED))
+    )
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (var-get contract-enabled) ERR-NOT-AUTHORIZED)
+    (asserts! (get locked lock-data) ERR-NOT-AUDIT-LOCKED)
+    
+    (ok (map-set credential-audit-lock credential-id (merge lock-data { locked: false })))
+  )
+)
+
+(define-public (verify-credential-secure (credential-id uint) (purpose (string-ascii 100)))
+  (let
+    (
+      (credential (unwrap! (map-get? credentials credential-id) ERR-CREDENTIAL-NOT-FOUND))
+      (current-block stacks-block-height)
+      (is-frozen (default-to false (get frozen (map-get? credential-freeze-status credential-id))))
+      (is-paused (default-to false (get paused (map-get? credential-pause-status credential-id))))
+      (is-audit-locked (default-to false (get locked (map-get? credential-audit-lock credential-id))))
+      (attempt-data (default-to { total-attempts: u0, last-attempt-at: u0, reset-at: current-block } (map-get? verification-attempt-count credential-id)))
+      (reset-block (get reset-at attempt-data))
+      (attempts (get total-attempts attempt-data))
+      (blocks-since-reset (- current-block reset-block))
+      (should-reset (>= blocks-since-reset ATTEMPT-RESET-BLOCKS))
+      (current-attempts (if should-reset u0 attempts))
+      (new-attempts (+ current-attempts u1))
+      (new-reset-at (if should-reset current-block reset-block))
+    )
+    (asserts! (var-get contract-enabled) ERR-NOT-AUTHORIZED)
+    (asserts! (not is-frozen) ERR-CREDENTIAL-FROZEN)
+    (asserts! (not is-paused) ERR-CREDENTIAL-PAUSED)
+    (asserts! (not is-audit-locked) ERR-CREDENTIAL-AUDIT-LOCKED)
+    (asserts! (is-eq (get status credential) STATUS-ACTIVE) ERR-CREDENTIAL-REVOKED)
+    (asserts! (> (get expiry-date credential) current-block) ERR-CREDENTIAL-EXPIRED)
+    (asserts! (< new-attempts VERIFICATION-ATTEMPT-THRESHOLD) ERR-VERIFICATION-SPAM)
+    
+    (try! (stx-transfer? VERIFICATION-FEE tx-sender CONTRACT-OWNER))
+    
+    (map-set verification-history 
+      { credential-id: credential-id, verifier: tx-sender, block-height: current-block }
+      {
+        timestamp: current-block,
+        verified-by: tx-sender,
+        purpose: purpose
+      }
+    )
+    
+    (map-set verification-attempt-count credential-id {
+      total-attempts: new-attempts,
+      last-attempt-at: current-block,
+      reset-at: new-reset-at
+    })
+    
+    (map-set credentials credential-id (merge credential {
+      verification-count: (+ (get verification-count credential) u1)
+    }))
+    
+    (var-set total-verifications (+ (var-get total-verifications) u1))
+    (ok true)
+  )
+)
+
+(define-read-only (is-credential-frozen (credential-id uint))
+  (default-to false (get frozen (map-get? credential-freeze-status credential-id)))
+)
+
+(define-read-only (is-credential-paused (credential-id uint))
+  (default-to false (get paused (map-get? credential-pause-status credential-id)))
+)
+
+(define-read-only (is-credential-audit-locked (credential-id uint))
+  (default-to false (get locked (map-get? credential-audit-lock credential-id)))
+)
+
+(define-read-only (get-verification-attempts (credential-id uint))
+  (match (map-get? verification-attempt-count credential-id)
+    attempt-data (get total-attempts attempt-data)
+    u0
+  )
+)
+
+(define-read-only (get-freeze-status (credential-id uint))
+  (map-get? credential-freeze-status credential-id)
+)
+
+(define-read-only (get-pause-status (credential-id uint))
+  (map-get? credential-pause-status credential-id)
+)
+
+(define-read-only (get-audit-lock-status (credential-id uint))
+  (map-get? credential-audit-lock credential-id)
+)
+
+(define-read-only (get-security-status (credential-id uint))
+  (match (map-get? credentials credential-id)
+    credential (some {
+      is-frozen: (is-credential-frozen credential-id),
+      is-paused: (is-credential-paused credential-id),
+      is-audit-locked: (is-credential-audit-locked credential-id),
+      verification-attempts: (get-verification-attempts credential-id),
+      credential-status: (get status credential),
+      is-expired: (>= stacks-block-height (get expiry-date credential))
+    })
+    none
+  )
+)
 
 (authorize-issuer CONTRACT-OWNER "Contract Owner" "system-admin")
